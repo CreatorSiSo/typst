@@ -256,8 +256,14 @@ fn to_syn(RgbaColor { r, g, b, a }: RgbaColor) -> synt::Color {
 }
 
 /// The syntect syntax definitions.
-static SYNTAXES: Lazy<syntect::parsing::SyntaxSet> =
-    Lazy::new(|| syntect::parsing::SyntaxSet::load_defaults_nonewlines());
+static SYNTAXES: Lazy<syntect::parsing::SyntaxSet> = Lazy::new(|| {
+    use syntect::parsing;
+    let mut builder = parsing::SyntaxSet::load_defaults_nonewlines().into_builder();
+    builder
+        .add_from_folder(std::path::Path::new("./custom"), true)
+        .unwrap();
+    builder.build()
+});
 
 /// The default theme used for syntax highlighting.
 pub static THEME: Lazy<synt::Theme> = Lazy::new(|| synt::Theme {
