@@ -120,6 +120,8 @@ struct CompileSettings {
 
     /// The paths to search for fonts.
     font_paths: Vec<PathBuf>,
+
+    /// The paths to search for syntaxes.
     syntax_paths: Vec<PathBuf>,
 }
 
