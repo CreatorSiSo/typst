@@ -22,7 +22,8 @@ use typst::eval::Library;
 use typst::font::{Font, FontBook, FontInfo, FontVariant};
 use typst::syntax::{Source, SourceId};
 use typst::util::{Buffer, PathExt};
-use typst::World;
+use typst::{SyntaxSetWrapper, World};
+use typst_library::prelude::EcoString;
 use walkdir::WalkDir;
 
 type CodespanResult<T> = Result<T, CodespanError>;
@@ -32,6 +33,7 @@ type CodespanError = codespan_reporting::files::Error;
 enum Command {
     Compile(CompileCommand),
     Fonts(FontsCommand),
+    Syntaxes(SyntaxesCommand),
 }
 
 /// Compile a .typ file into a PDF file.
@@ -41,6 +43,7 @@ struct CompileCommand {
     root: Option<PathBuf>,
     watch: bool,
     font_paths: Vec<PathBuf>,
+    syntax_paths: Vec<PathBuf>,
 }
 
 const HELP: &'static str = "\
@@ -55,14 +58,16 @@ ARGS:
   [output.pdf]   Path to output PDF file
 
 OPTIONS:
-  -h, --help        Print this help
-  -V, --version     Print the CLI's version
-  -w, --watch       Watch the inputs and recompile on changes
-  --font-path <dir> Add additional directories to search for fonts
-  --root <dir>      Configure the root for absolute paths
+  -h, --help          Print this help
+  -V, --version       Print the CLI's version
+  -w, --watch         Watch the inputs and recompile on changes
+  --font-path <dir>   Add additional directories to search for fonts
+  --syntax-path <dir> Add directories to search for .sublime-syntax files
+  --root <dir>        Configure the root for absolute paths
 
 SUBCOMMANDS:
-  --fonts           List all discovered fonts in system and custom font paths
+  --fonts             List all discovered fonts in system and custom font paths
+  --syntaxes          List all discovered syntaxes in custom syntax paths
 ";
 
 /// List discovered system fonts.
@@ -81,6 +86,21 @@ OPTIONS:
   -h, --help        Print this help
   --font-path <dir> Add additional directories to search for fonts
   --variants        Also list style variants of each font family
+";
+
+struct SyntaxesCommand {
+    syntax_paths: Vec<PathBuf>,
+}
+
+const HELP_SYNTAXES: &'static str = "\
+typst --syntaxes lists all discovered syntaxes in custom syntax paths
+
+USAGE:
+  typst --syntaxes [OPTIONS]
+
+OPTIONS:
+  -h, --help        Print this help
+  --font-path <dir> Add additional directories to search for fonts
 ";
 
 /// Entry point.
@@ -105,13 +125,18 @@ fn parse_args() -> StrResult<Command> {
 
     let help = args.contains(["-h", "--help"]);
     let font_paths = args.values_from_str("--font-path").unwrap();
+    let syntax_paths = args.values_from_str("--syntax-path").unwrap();
 
     let command = if args.contains("--fonts") {
         if help {
             print_help(HELP_FONTS);
         }
-
         Command::Fonts(FontsCommand { font_paths, variants: args.contains("--variants") })
+    } else if args.contains("--syntaxes") {
+        if help {
+            print_help(HELP_SYNTAXES);
+        }
+        Command::Syntaxes(SyntaxesCommand { syntax_paths })
     } else {
         if help {
             print_help(HELP);
@@ -120,7 +145,14 @@ fn parse_args() -> StrResult<Command> {
         let root = args.opt_value_from_str("--root").map_err(|_| "missing root path")?;
         let watch = args.contains(["-w", "--watch"]);
         let (input, output) = parse_input_output(&mut args, "pdf")?;
-        Command::Compile(CompileCommand { input, output, watch, root, font_paths })
+        Command::Compile(CompileCommand {
+            input,
+            output,
+            watch,
+            root,
+            font_paths,
+            syntax_paths,
+        })
     };
 
     // Don't allow excess arguments.
@@ -182,6 +214,7 @@ fn dispatch(command: Command) -> StrResult<()> {
     match command {
         Command::Compile(command) => compile(command),
         Command::Fonts(command) => fonts(command),
+        Command::Syntaxes(command) => syntaxes(command),
     }
 }
 
@@ -202,7 +235,7 @@ fn compile(command: CompileCommand) -> StrResult<()> {
     };
 
     // Create the world that serves sources, fonts and files.
-    let mut world = SystemWorld::new(root, &command.font_paths);
+    let mut world = SystemWorld::new(root, &command.font_paths, &command.syntax_paths);
 
     // Perform initial compilation.
     let failed = compile_once(&mut world, &command)?;
@@ -392,12 +425,32 @@ fn fonts(command: FontsCommand) -> StrResult<()> {
     Ok(())
 }
 
+/// Execute a syntaxes listing command.
+fn syntaxes(command: SyntaxesCommand) -> StrResult<()> {
+    if command.syntax_paths.is_empty() {
+        return Err(EcoString::from("No path was provided via --syntax-path"));
+    }
+    let mut builder = syntect::parsing::SyntaxSetBuilder::new();
+    for path in command.syntax_paths {
+        builder
+            .add_from_folder(path, false)
+            .map_err(|err| EcoString::from(err.to_string()))?;
+    }
+    for syntax in builder.syntaxes() {
+        println!("{}", syntax.name);
+        println!("- Extensions: {:?}", syntax.file_extensions);
+        println!("- Scope: {:?}", syntax.scope);
+    }
+    Ok(())
+}
+
 /// A world that provides access to the operating system.
 struct SystemWorld {
     root: PathBuf,
     library: Prehashed<Library>,
     book: Prehashed<FontBook>,
     fonts: Vec<FontSlot>,
+    syntax_set: SyntaxSetWrapper,
     hashes: RefCell<HashMap<PathBuf, FileResult<PathHash>>>,
     paths: RefCell<HashMap<PathHash, PathSlot>>,
     sources: FrozenVec<Box<Source>>,
@@ -419,7 +472,7 @@ struct PathSlot {
 }
 
 impl SystemWorld {
-    fn new(root: PathBuf, font_paths: &[PathBuf]) -> Self {
+    fn new(root: PathBuf, font_paths: &[PathBuf], syntax_paths: &[PathBuf]) -> Self {
         let mut searcher = FontSearcher::new();
         searcher.search_system();
 
@@ -430,11 +483,18 @@ impl SystemWorld {
             searcher.search_dir(path)
         }
 
+        let mut syntax_set_builder = syntect::parsing::SyntaxSetBuilder::new();
+        for path in syntax_paths {
+            // TODO: Report errors
+            let _ = syntax_set_builder.add_from_folder(path, false);
+        }
+
         Self {
             root,
             library: Prehashed::new(typst_library::build()),
             book: Prehashed::new(searcher.book),
             fonts: searcher.fonts,
+            syntax_set: SyntaxSetWrapper(syntax_set_builder.build()),
             hashes: RefCell::default(),
             paths: RefCell::default(),
             sources: FrozenVec::new(),
@@ -483,6 +543,10 @@ impl World for SystemWorld {
                 Font::new(data, slot.index)
             })
             .clone()
+    }
+
+    fn syntax_set(&self) -> &SyntaxSetWrapper {
+        &self.syntax_set
     }
 
     fn file(&self, path: &Path) -> FileResult<Buffer> {
